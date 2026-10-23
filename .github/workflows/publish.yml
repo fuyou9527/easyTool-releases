@@ -84,7 +84,8 @@ jobs:
             for (const name of installers) verify(name, files.get(`${name}.sig`).toString());
             if (!manifest.platforms?.['windows-x86_64']) throw new Error('Missing Windows update');
             for (const platform of Object.values(manifest.platforms)) {
-              const name = decodeURIComponent(new URL(platform.url).pathname.split('/').pop());
+              const name = assets.find(asset => asset.sourceUrl === platform.url)?.name
+                || decodeURIComponent(new URL(platform.url).pathname.split('/').pop());
               verify(name, platform.signature);
               platform.url = `https://github.com/${context.repo.owner}/${context.repo.repo}/releases/download/${tag}/${encodeURIComponent(name)}`;
             }
