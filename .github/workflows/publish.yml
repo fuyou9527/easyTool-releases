@@ -91,12 +91,9 @@ jobs:
             manifest.notes = `Memo ${tag}\n\n- 支持白天和黑夜主题、多标签筛选和笔记修改时间线。\n- 支持本地数据备份与离线迁移。\n- 通过公开发布仓库检测和下载更新，本地笔记不会上传。`;
             files.set('latest.json', Buffer.from(JSON.stringify(manifest, null, 2) + '\n'));
             files.set('SHA256SUMS.txt', Buffer.from(installers.map(name => `${crypto.createHash('sha256').update(files.get(name)).digest('hex')}  ${name}`).join('\n') + '\n'));
-            let release;
-            try {
-              release = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag })).data;
-              if (!release.draft) throw new Error('Release is already published');
-            } catch (error) {
-              if (error.status !== 404) throw error;
+            let release = (await github.paginate(github.rest.repos.listReleases, { ...context.repo, per_page: 100 })).find(release => release.tag_name === tag);
+            if (release && !release.draft) throw new Error('Release is already published');
+            if (!release) {
               release = (await github.rest.repos.createRelease({ ...context.repo, tag_name: tag, name: `Memo ${tag}`, draft: true, body: `${manifest.notes}\n\n下载 setup.exe 安装，也可选择 MSI。旧版需先手动安装一次本版本。\n\n已通过云端构建和安装包签名校验；真实 Windows 安装、重启及原地更新尚未实测。` })).data;
             }
             for (const [name, bytes] of files) {
