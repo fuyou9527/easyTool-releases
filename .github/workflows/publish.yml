@@ -1,0 +1,109 @@
+name: Publish verified installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Application version
+        required: true
+        type: string
+      assets:
+        description: Temporary download URLs for signed installer assets
+        required: true
+        type: string
+      public_key:
+        description: Expected updater public key
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download, verify and publish installers
+        uses: actions/github-script@v8
+        env:
+          APP_VERSION: ${{ inputs.version }}
+          RELEASE_ASSETS: ${{ inputs.assets }}
+          UPDATER_PUBLIC_KEY: ${{ inputs.public_key }}
+        with:
+          script: |
+            const crypto = require('node:crypto');
+            const version = process.env.APP_VERSION;
+            if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Invalid version');
+            const tag = `v${version}`;
+            const assets = JSON.parse(process.env.RELEASE_ASSETS);
+            if (assets.length !== 5) throw new Error('Expected manifest, two installers and two signatures');
+            const files = new Map();
+            await Promise.all(assets.map(async asset => {
+              if (!/^[\w.-]+$/.test(asset.name) || !(asset.name === 'latest.json' || /\.(exe|msi)(\.sig)?$/.test(asset.name))) throw new Error('Unexpected asset');
+              const url = new URL(asset.url);
+              if (url.protocol !== 'https:' || url.hostname !== 'release-assets.githubusercontent.com') throw new Error('Unexpected download host');
+              let bytes;
+              for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                  const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(90000) });
+                  if (!response.ok) throw new Error(`Download status ${response.status}`);
+                  bytes = Buffer.from(await response.arrayBuffer());
+                  if (bytes.length !== asset.size) throw new Error('Asset size mismatch');
+                  if (asset.digest && asset.digest !== `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`) throw new Error('Asset digest mismatch');
+                  break;
+                } catch (error) {
+                  if (attempt === 2) throw error;
+                }
+              }
+              files.set(asset.name, bytes);
+            }));
+            const manifest = JSON.parse(files.get('latest.json').toString());
+            if (manifest.version.replace(/^v/, '') !== version) throw new Error('Manifest version mismatch');
+            const packet = Buffer.from(Buffer.from(process.env.UPDATER_PUBLIC_KEY, 'base64').toString().trim().split(/\r?\n/)[1], 'base64');
+            const key = crypto.createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), packet.subarray(10)]), format: 'der', type: 'spki' });
+            function verify(name, encoded) {
+              const lines = Buffer.from(encoded.trim(), 'base64').toString().trim().split(/\r?\n/);
+              const sig = Buffer.from(lines[1], 'base64');
+              if (sig.length !== 74 || !sig.subarray(2, 10).equals(packet.subarray(2, 10))) throw new Error('Signing key mismatch');
+              if (!lines[2]?.startsWith('trusted comment: ')) throw new Error('Missing signature metadata');
+              if (!crypto.verify(null, Buffer.concat([sig.subarray(10), Buffer.from(lines[2].slice(17))]), key, Buffer.from(lines[3], 'base64'))) throw new Error('Invalid signature metadata');
+              const algorithm = sig.subarray(0, 2).toString();
+              if (!['Ed', 'ED'].includes(algorithm)) throw new Error('Unknown signature algorithm');
+              const bytes = files.get(name);
+              if (!bytes) throw new Error('Missing installer');
+              const signed = algorithm === 'ED' ? crypto.createHash('blake2b512').update(bytes).digest() : bytes;
+              if (!crypto.verify(null, signed, key, sig.subarray(10))) throw new Error('Invalid installer signature');
+            }
+            const installers = [...files.keys()].filter(name => /\.(exe|msi)$/.test(name));
+            if (!installers.some(name => name.endsWith('.exe')) || !installers.some(name => name.endsWith('.msi'))) throw new Error('Missing installer format');
+            for (const name of installers) verify(name, files.get(`${name}.sig`).toString());
+            if (!manifest.platforms?.['windows-x86_64']) throw new Error('Missing Windows update');
+            for (const platform of Object.values(manifest.platforms)) {
+              const name = decodeURIComponent(new URL(platform.url).pathname.split('/').pop());
+              verify(name, platform.signature);
+              platform.url = `https://github.com/${context.repo.owner}/${context.repo.repo}/releases/download/${tag}/${encodeURIComponent(name)}`;
+            }
+            manifest.notes = `Memo ${tag}\n\n- 支持白天和黑夜主题、多标签筛选和笔记修改时间线。\n- 支持本地数据备份与离线迁移。\n- 通过公开发布仓库检测和下载更新，本地笔记不会上传。`;
+            files.set('latest.json', Buffer.from(JSON.stringify(manifest, null, 2) + '\n'));
+            files.set('SHA256SUMS.txt', Buffer.from(installers.map(name => `${crypto.createHash('sha256').update(files.get(name)).digest('hex')}  ${name}`).join('\n') + '\n'));
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag })).data;
+              if (!release.draft) throw new Error('Release is already published');
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              release = (await github.rest.repos.createRelease({ ...context.repo, tag_name: tag, name: `Memo ${tag}`, draft: true, body: `${manifest.notes}\n\n下载 setup.exe 安装，也可选择 MSI。旧版需先手动安装一次本版本。\n\n已通过云端构建和安装包签名校验；真实 Windows 安装、重启及原地更新尚未实测。` })).data;
+            }
+            for (const [name, bytes] of files) {
+              const previous = release.assets.find(asset => asset.name === name);
+              if (previous) await github.rest.repos.deleteReleaseAsset({ ...context.repo, asset_id: previous.id });
+              await github.rest.repos.uploadReleaseAsset({ ...context.repo, release_id: release.id, name, data: bytes });
+            }
+            await github.rest.repos.updateRelease({ ...context.repo, release_id: release.id, draft: false, prerelease: false, make_latest: 'true' });
+            core.summary.addLink('Download Memo', `https://github.com/${context.repo.owner}/${context.repo.repo}/releases/tag/${tag}`);
+            await core.summary.write();
